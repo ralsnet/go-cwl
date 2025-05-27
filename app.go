@@ -96,14 +96,15 @@ func (a *App) Start(ctx context.Context) error {
 	}
 	a.cfg = cfg
 
+	c, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	defer func() {
 		if err := recover(); err != nil {
+			a.Close()
 			fmt.Println(err)
 		}
 	}()
-
-	c, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	quit := false
 	qs := make(chan os.Signal, 1)
