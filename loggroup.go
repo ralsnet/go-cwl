@@ -16,7 +16,12 @@ import (
 
 type LogGroup struct {
 	client   *cloudwatchlogs.Client
+	profile  string
 	LogGroup types.LogGroup
+}
+
+func (lg *LogGroup) Profile() string {
+	return lg.profile
 }
 
 func (lg *LogGroup) Name() string {
@@ -50,17 +55,17 @@ func (lg *LogGroup) Stream(ctx context.Context) (*cloudwatchlogs.StartLiveTailEv
 	return output.GetStream(), nil
 }
 
-func GetLogGroups(ctx context.Context, cfgs []aws.Config) ([]*LogGroup, error) {
+func GetLogGroups(ctx context.Context, cfgs map[string]aws.Config) ([]*LogGroup, error) {
 	m := make(map[string]struct{})
 
 	errs := []error{}
 
 	logGroups := []*LogGroup{}
 	wg := sync.WaitGroup{}
-	for _, cfg := range cfgs {
+	for profile, cfg := range cfgs {
 		client := cloudwatchlogs.NewFromConfig(cfg)
 		wg.Add(1)
-		go func(client *cloudwatchlogs.Client) {
+		go func(client *cloudwatchlogs.Client, profile string) {
 			defer wg.Done()
 			var nextToken *string
 			for {
@@ -79,6 +84,7 @@ func GetLogGroups(ctx context.Context, cfgs []aws.Config) ([]*LogGroup, error) {
 					m[*logGroup.LogGroupArn] = struct{}{}
 					logGroups = append(logGroups, &LogGroup{
 						client:   client,
+						profile:  profile,
 						LogGroup: logGroup,
 					})
 				}
@@ -87,7 +93,7 @@ func GetLogGroups(ctx context.Context, cfgs []aws.Config) ([]*LogGroup, error) {
 					break
 				}
 			}
-		}(client)
+		}(client, profile)
 	}
 	wg.Wait()
 

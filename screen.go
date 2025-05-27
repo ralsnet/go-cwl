@@ -142,7 +142,7 @@ func (s *ChooseLogsScreen) Render(ctx context.Context, tty *TTY) error {
 		tty.WriteString("Search (r: reset): %s", s.filter)
 		tty.NextLine(1)
 	} else {
-		tty.WriteString("(/: search, space: select/unselect, j/k: navigate, enter: apply)")
+		tty.WriteString("(/: search, space: select/unselect, j/k: up/down, h/l: prev/next, enter: apply)")
 		tty.NextLine(1)
 	}
 	tty.NextLine(1)
@@ -156,7 +156,7 @@ func (s *ChooseLogsScreen) Render(ctx context.Context, tty *TTY) error {
 				break
 			}
 		}
-		option := fmt.Sprintf("%3d. [%s] %s (%s)", i+1, x, log.Name(), log.AccountID())
+		option := fmt.Sprintf("%3d. [%s] %s (%s:%s)", i+1, x, log.Name(), log.AccountID(), log.Profile())
 		if len(option) > col-3 {
 			option = option[:col-6] + "..."
 		}
@@ -196,6 +196,10 @@ func (s *ChooseLogsScreen) HandleInput(ctx context.Context, r rune) (bool, error
 		s.down(ctx)
 	case 'k':
 		s.up(ctx)
+	case 'l':
+		s.next(ctx)
+	case 'h':
+		s.prev(ctx)
 	case ' ':
 		contains := false
 		for _, selected := range s.selected {
@@ -278,6 +282,24 @@ func (s *ChooseLogsScreen) up(_ context.Context) {
 	if s.index < s.offset {
 		s.offset--
 	}
+}
+
+func (s *ChooseLogsScreen) next(_ context.Context) {
+	nextOffset := s.offset + s.limit + 1
+	if len(s.filtered)-1 <= nextOffset {
+		return
+	}
+	s.offset = nextOffset
+	s.index = nextOffset
+}
+
+func (s *ChooseLogsScreen) prev(_ context.Context) {
+	prevOffset := s.offset - s.limit
+	if prevOffset < 0 {
+		prevOffset = 0
+	}
+	s.offset = prevOffset
+	s.index = prevOffset
 }
 
 const (

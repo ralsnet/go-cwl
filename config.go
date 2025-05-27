@@ -18,7 +18,7 @@ const (
 	SectionNameProfile = "profile"
 )
 
-func LoadAWSConfigs(ctx context.Context, excludeProfiles []string) ([]aws.Config, error) {
+func LoadAWSConfigs(ctx context.Context, excludeProfiles []string) (map[string]aws.Config, error) {
 	f := config.DefaultSharedConfigFilename()
 
 	inif, err := ini.Load(f)
@@ -26,7 +26,7 @@ func LoadAWSConfigs(ctx context.Context, excludeProfiles []string) ([]aws.Config
 		return nil, err
 	}
 
-	configs := make([]aws.Config, 0)
+	configs := make(map[string]aws.Config, 0)
 	mu := sync.Mutex{}
 	wg := sync.WaitGroup{}
 	for _, section := range inif.Sections() {
@@ -50,7 +50,7 @@ func LoadAWSConfigs(ctx context.Context, excludeProfiles []string) ([]aws.Config
 				return
 			}
 			mu.Lock()
-			configs = append(configs, cfg)
+			configs[profile] = cfg
 			mu.Unlock()
 		}(profile)
 	}
@@ -64,7 +64,8 @@ type Config struct {
 }
 
 const (
-	ConfigFile = ".cwl.json"
+	DotConfigFile = ".cwl.json"
+	ConfigFile    = "cwl.json"
 )
 
 func LoadDefaultConfig(ctx context.Context) (*Config, error) {
@@ -73,7 +74,7 @@ func LoadDefaultConfig(ctx context.Context) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := LoadConfig(ctx, filepath.Join(cwd, ConfigFile))
+	cfg, err := LoadConfig(ctx, filepath.Join(cwd, DotConfigFile))
 	if err == nil {
 		return cfg, nil
 	}
@@ -82,7 +83,7 @@ func LoadDefaultConfig(ctx context.Context) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err = LoadConfig(ctx, filepath.Join(home, ConfigFile))
+	cfg, err = LoadConfig(ctx, filepath.Join(home, DotConfigFile))
 	if err == nil {
 		return cfg, nil
 	}
