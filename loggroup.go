@@ -3,6 +3,7 @@ package cwl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -67,6 +68,11 @@ func GetLogGroups(ctx context.Context, cfgs map[string]aws.Config) ([]*LogGroup,
 		wg.Add(1)
 		go func(client *cloudwatchlogs.Client, profile string) {
 			defer wg.Done()
+			defer func() {
+				if err := recover(); err != nil {
+					fmt.Println(err)
+				}
+			}()
 			var nextToken *string
 			for {
 				output, err := client.DescribeLogGroups(ctx, &cloudwatchlogs.DescribeLogGroupsInput{

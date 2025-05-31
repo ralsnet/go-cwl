@@ -40,6 +40,12 @@ func NewApp() *App {
 }
 
 func (a *App) ShowLoading(ctx context.Context) error {
+	cfg, err := LoadDefaultConfig(ctx)
+	if err != nil {
+		return err
+	}
+	a.cfg = cfg
+
 	cfgs, err := LoadAWSConfigs(ctx, a.cfg.ExcludeProfiles)
 	if err != nil {
 		return err
@@ -90,37 +96,28 @@ func (a *App) handleCtrl(ctx context.Context, ctrl string) (bool, error) {
 }
 
 func (a *App) Start(ctx context.Context) error {
-	cfg, err := LoadDefaultConfig(ctx)
-	if err != nil {
-		return err
-	}
-	a.cfg = cfg
-
-	c, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+
+	quit := false
+	go func() {
+		<-sig
+		a.ForceUnlock()
+		quit = true
+		cancel()
+		a.Close()
+	}()
 
 	defer func() {
 		if err := recover(); err != nil {
-			a.Close()
-			fmt.Println(err)
-		}
-	}()
-
-	quit := false
-	qs := make(chan os.Signal, 1)
-	signal.Notify(qs, os.Interrupt)
-	defer close(qs)
-	go func() {
-		<-qs
-		quit = true
-		cancel()
-	}()
-
-	go func() {
-		if err := a.ShowLoading(c); err != nil {
+			a.ForceUnlock()
+			quit = true
 			cancel()
 			a.Close()
-			panic(err)
+			fmt.Println(err)
 		}
 	}()
 
@@ -129,101 +126,113 @@ func (a *App) Start(ctx context.Context) error {
 	}
 	defer a.Close()
 
-	go func(ctx context.Context) {
-		ticker := time.NewTicker(time.Second / fps)
-		defer ticker.Stop()
-		for {
+	go func() {
+		if err := a.ShowLoading(ctx); err != nil {
+			a.ForceUnlock()
+			quit = true
+			cancel()
+			a.Close()
+			fmt.Println(err)
+		}
+	}()
+
+	go func() {
+		ctrl := false
+		ctrlCode := ""
+		for !quit {
+			r, err := a.tty.Rune()
 			a.mu.Lock()
-			a.render(ctx)
+			if err != nil {
+				a.mu.Unlock()
+				return
+			}
+
+			if string(r) == "\x1b" {
+				ctrl = true
+				go func() {
+					time.Sleep(time.Millisecond * 10)
+					ctrl = false
+				}()
+				a.mu.Unlock()
+				continue
+			}
+			if ctrl {
+				ctrlCode += string(r)
+				if ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') {
+					ctrl = false
+					handled, err := a.handleCtrl(ctx, "\x1b"+ctrlCode)
+					if err != nil {
+						a.mu.Unlock()
+						return
+					}
+					if !handled {
+						a.mu.Unlock()
+						return
+					}
+					ctrlCode = ""
+				}
+				a.mu.Unlock()
+				continue
+			}
+
+			// Ctrl+C
+			if r == 3 {
+				a.mu.Unlock()
+				return
+			}
+
+			handled, err := a.handleInput(ctx, r)
 			a.mu.Unlock()
+			if err != nil {
+				return
+			}
+			if !handled {
+				return
+			}
+
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			default:
 				continue
 			}
 		}
-	}(c)
+	}()
 
-	ctrl := false
-	ctrlCode := ""
-	for !quit {
-		r, err := a.tty.Rune()
+	ticker := time.NewTicker(time.Second / fps)
+	defer ticker.Stop()
+	for {
 		a.mu.Lock()
-		if err != nil {
-			a.mu.Unlock()
-			return err
-		}
-
-		if string(r) == "\x1b" {
-			ctrl = true
-			go func() {
-				time.Sleep(time.Millisecond * 10)
-				ctrl = false
-			}()
-			a.mu.Unlock()
-			continue
-		}
-		if ctrl {
-			ctrlCode += string(r)
-			if ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') {
-				ctrl = false
-				handled, err := a.handleCtrl(c, "\x1b"+ctrlCode)
-				if err != nil {
-					a.mu.Unlock()
-					return err
-				}
-				if !handled {
-					a.mu.Unlock()
-					return nil
-				}
-				ctrlCode = ""
-			}
-			a.mu.Unlock()
-			continue
-		}
-
-		// Ctrl+C
-		if r == 3 {
-			a.mu.Unlock()
-			return nil
-		}
-
-		handled, err := a.handleInput(c, r)
+		a.render(ctx)
 		a.mu.Unlock()
-		if err != nil {
-			return err
-		}
-		if !handled {
-			return nil
-		}
-
 		select {
-		case <-c.Done():
+		case <-ctx.Done():
 			return nil
-		default:
+		case <-ticker.C:
 			continue
 		}
 	}
-
-	return nil
 }
 
 func (a *App) Open() error {
 	if err := a.tty.Open(); err != nil {
 		return err
 	}
-	a.tty.EnableAlt()
-	a.tty.HideCursor()
 	return nil
 }
 
 func (a *App) Close() error {
-	a.tty.DisableAlt()
-	a.tty.ShowCursor()
-	return a.tty.Close()
+	a.ForceUnlock()
+	a.tty.Close()
+	return nil
 }
 
 func (a *App) Opened() bool {
-	return a.tty.opened
+	return a.tty.t != nil
+}
+
+func (a *App) ForceUnlock() {
+	if !a.mu.TryLock() {
+		a.mu.Unlock()
+	}
 }

@@ -3,6 +3,7 @@ package cwl
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -59,6 +60,7 @@ func (s *LoadingScreen) Init(ctx context.Context) {
 }
 
 func (s *LoadingScreen) Render(ctx context.Context, tty *TTY) error {
+	fmt.Println("LoadingScreen.Render")
 	if err := tty.Clear(); err != nil {
 		return err
 	}
@@ -313,7 +315,12 @@ type DisplayLogScreen struct {
 	buffers map[string][]*LogEvent
 	streams map[string]*cloudwatchlogs.StartLiveTailEventStream
 	index   map[string]int
+	offset  map[string]int
+	live    map[string]bool
 	changed map[string]bool
+	view    map[string]int
+	row     int
+	col     int
 	rw      sync.RWMutex
 }
 
@@ -325,7 +332,10 @@ func NewDisplayLogScreen(logs []*LogGroup, back func([]*LogGroup)) *DisplayLogSc
 		buffers: make(map[string][]*LogEvent, len(logs)),
 		streams: make(map[string]*cloudwatchlogs.StartLiveTailEventStream, len(logs)),
 		index:   make(map[string]int, len(logs)),
+		offset:  make(map[string]int, len(logs)),
+		live:    make(map[string]bool, len(logs)),
 		changed: make(map[string]bool, len(logs)),
+		view:    make(map[string]int, len(logs)),
 	}
 
 	return screen
@@ -342,15 +352,18 @@ func (s *DisplayLogScreen) Init(ctx context.Context) {
 			}
 			s.streams[log.ARN()] = stream
 			s.index[log.ARN()] = -1
+			s.offset[log.ARN()] = 0
+			s.live[log.ARN()] = true
 			s.changed[log.ARN()] = true
 			s.rw.Unlock()
 			defer func() {
+				if err := recover(); err != nil {
+					fmt.Println(err)
+				}
 				stream.Close()
-				s.rw.Lock()
 				delete(s.streams, log.ARN())
 				delete(s.index, log.ARN())
 				delete(s.changed, log.ARN())
-				s.rw.Unlock()
 			}()
 			for {
 				evt := <-stream.Events()
@@ -394,78 +407,106 @@ func (s *DisplayLogScreen) Render(ctx context.Context, tty *TTY) error {
 	s.rw.RLock()
 	defer s.rw.RUnlock()
 
-	events := s.showableEvents(row-3, col)
+	s.handleViewMode(ctx, tty)
+
+	live := s.live[s.log.ARN()]
 
 	buf := bytes.NewBuffer(nil)
 
-	for _, evt := range events {
-		buf.WriteString(fmt.Sprintf("\x1b[32m%s\x1b[0m", evt.Timestamp().Format("2006-01-02 15:04:05")))
+	buf.WriteString(fmt.Sprintf("\x1b[32m%s\x1b[0m", s.log.ARN()))
+	buf.WriteString(" ")
+	status := "paused"
+	if live {
+		status = "live"
+	}
+	buf.WriteString(fmt.Sprintf("\x1b[32m%s\x1b[0m", status))
+	buf.WriteString("\n")
+
+	if len(s.buffers[s.log.ARN()]) == 0 {
+		body := strings.ReplaceAll(buf.String(), "\n", CursorNextLine)
+		tty.WriteString("%s", body)
+		return nil
+	}
+
+	view := s.view[s.log.ARN()]
+	if view == viewModeAlt {
+
+		idx := s.index[s.log.ARN()]
+		log := s.buffers[s.log.ARN()][idx]
+
+		message := log.Message()
+
+		var b []byte
+		// try json.Unmarshal
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal([]byte(message), &jsonData); err == nil {
+			b, _ = json.MarshalIndent(jsonData, "", "  ")
+		} else {
+			b = []byte(message)
+		}
+
+		body := strings.ReplaceAll(string(b), "\n", CursorNextLine)
+		tty.WriteString("%s", body)
+
+		return nil
+	}
+
+	s.row = row
+	s.col = col
+
+	rows := row - 2
+
+	allEvents := s.buffers[s.log.ARN()]
+	lastidx := len(s.buffers[s.log.ARN()]) - 1
+
+	if live {
+		offset := lastidx - rows
+		if offset < 0 {
+			offset = 0
+		}
+		s.offset[s.log.ARN()] = offset
+		s.index[s.log.ARN()] = lastidx
+	}
+
+	idx := s.index[s.log.ARN()]
+	offset := s.offset[s.log.ARN()]
+	limit := offset + rows + 1
+	if limit > lastidx {
+		limit = lastidx + 1
+	}
+	events := allEvents[offset:limit]
+
+	for i, evt := range events {
+		evtidx := i + offset
+		timestamp := evt.Timestamp().Format("2006-01-02 15:04:05")
+		message := evt.Message()
+		chars := len(timestamp) + len(message) + 1
+		overflow := col - chars
+		if overflow < 0 {
+			messageLen := len(message) + overflow - 3
+			if messageLen < 0 {
+				message = ""
+			} else {
+				message = message[:messageLen] + "..."
+			}
+		}
+
+		line := ""
+		if evtidx == idx {
+			line += "\x1b[7m"
+		}
+		line += fmt.Sprintf("\x1b[32m%s", timestamp)
+		line += " "
+		line += fmt.Sprintf("\x1b[33m%s", message)
+		line += "\x1b[0m"
+		buf.WriteString(line)
 		buf.WriteString("\n")
-		buf.WriteString(fmt.Sprintf("\x1b[33m%s\x1b[0m", evt.Message()))
-		buf.WriteString("\n")
 	}
-
-	live := fmt.Sprintf("%d/%d", s.index[s.log.ARN()]+1, len(s.buffers[s.log.ARN()]))
-	if s.index[s.log.ARN()] == -1 {
-		live = fmt.Sprintf("live/%d", len(s.buffers[s.log.ARN()]))
-	}
-
-	title := fmt.Sprintf("%s (%s) (%s)", s.log.Name(), s.log.AccountID(), live)
-	if len(title) > col-3 {
-		title = title[:col-6] + "..."
-	}
-
-	tty.WriteString("\x1b[1m%s\x1b[0m", title)
-	tty.NextLine(1)
-	tty.WriteString("backspace: back")
-	tty.NextLine(1)
 
 	body := strings.ReplaceAll(buf.String(), "\n", CursorNextLine)
 	tty.WriteString("%s", body)
 
 	return nil
-}
-
-func (s *DisplayLogScreen) showableEvents(row, col int) []LogEvent {
-	evts := s.buffers[s.log.ARN()]
-	index := s.index[s.log.ARN()]
-
-	last := len(evts) - 1
-	if index >= 0 {
-		last = index
-	}
-
-	events := make([]LogEvent, 0, len(evts))
-
-	lines := 0
-	for i := last; i >= 0; i-- {
-		evt := evts[i]
-		lines += len(evt.Lines(col)) + 1
-		if lines < row {
-			events = append(events, *evt)
-		} else {
-			break
-		}
-	}
-
-	if len(events) == 0 && len(evts) > 0 {
-		evt := *evts[last]
-		lines := evt.Lines(col)
-		if len(lines) > row-1 {
-			lines = lines[:row-1]
-		}
-		lastLine := lines[len(lines)-1]
-		if len(lastLine) > col-3 {
-			lastLine = lastLine[:col-3] + "..."
-			lines[len(lines)-1] = lastLine
-		}
-		evt.msg = strings.Join(lines, "")
-		events = append(events, evt)
-	}
-
-	slices.Reverse(events)
-
-	return events
 }
 
 func (s *DisplayLogScreen) HandleInput(ctx context.Context, r rune) (bool, error) {
@@ -479,13 +520,24 @@ func (s *DisplayLogScreen) HandleInput(ctx context.Context, r rune) (bool, error
 		}
 		s.back(s.logs)
 	case 'j':
-		s.scrollDown(ctx)
+		s.cursorDown(ctx, 1)
 	case 'k':
-		s.scrollUp(ctx)
+		s.cursorUp(ctx, 1)
+	case 'J':
+		s.cursorDown(ctx, s.row-2)
+	case 'K':
+		s.cursorUp(ctx, s.row-2)
 	case 'l':
 		s.next(ctx)
 	case 'h':
 		s.prev(ctx)
+	case ',': // Toggle Live Mode
+		if len(s.buffers[s.log.ARN()]) == 0 {
+			return true, nil
+		}
+		s.live[s.log.ARN()] = !s.live[s.log.ARN()]
+	case ' ':
+		s.viewMode(ctx)
 	}
 	return true, nil
 }
@@ -495,9 +547,9 @@ func (s *DisplayLogScreen) HandleCtrl(ctx context.Context, ctrl string) (bool, e
 	defer s.rw.Unlock()
 	switch ctrl {
 	case CursorUp:
-		s.scrollUp(ctx)
+		s.cursorUp(ctx, 1)
 	case CursorDown:
-		s.scrollDown(ctx)
+		s.cursorDown(ctx, 1)
 	case CursorRight:
 		s.next(ctx)
 	case CursorLeft:
@@ -506,26 +558,61 @@ func (s *DisplayLogScreen) HandleCtrl(ctx context.Context, ctrl string) (bool, e
 	return true, nil
 }
 
-func (s *DisplayLogScreen) scrollUp(_ context.Context) {
-	index := s.index[s.log.ARN()]
-	if index == -1 {
-		s.index[s.log.ARN()] = len(s.buffers[s.log.ARN()]) - 1
-	} else if index > 0 {
-		s.index[s.log.ARN()] = index - 1
+func (s *DisplayLogScreen) cursorUp(_ context.Context, move int) {
+	lastidx := len(s.buffers[s.log.ARN()]) - 1
+	if lastidx < 0 {
+		return
 	}
+
+	s.live[s.log.ARN()] = false
+
+	index := s.index[s.log.ARN()] - move
+	if index < 0 {
+		index = 0
+	}
+	s.index[s.log.ARN()] = index
+
+	offset := s.offset[s.log.ARN()]
+	if index < offset {
+		s.offset[s.log.ARN()] = index
+	} else if index > lastidx {
+		s.offset[s.log.ARN()] = lastidx
+	}
+
 	s.changed[s.log.ARN()] = true
 }
 
-func (s *DisplayLogScreen) scrollDown(_ context.Context) {
-	index := s.index[s.log.ARN()]
-	if index == -1 {
+func (s *DisplayLogScreen) cursorDown(_ context.Context, move int) {
+	lastidx := len(s.buffers[s.log.ARN()]) - 1
+	if lastidx < 0 {
 		return
-	} else if index < len(s.buffers[s.log.ARN()])-1 {
-		s.index[s.log.ARN()] = index + 1
 	}
-	if index == len(s.buffers[s.log.ARN()])-1 {
-		s.index[s.log.ARN()] = -1
+
+	s.live[s.log.ARN()] = false
+
+	index := s.index[s.log.ARN()] + move
+	if index > lastidx {
+		index = lastidx
 	}
+	s.index[s.log.ARN()] = index
+
+	offset := s.offset[s.log.ARN()]
+
+	botidx := s.row + offset - 2
+	if botidx > lastidx {
+		botidx = lastidx
+	}
+
+	if index > botidx {
+		offset += index - botidx
+	}
+	if offset > lastidx {
+		offset = lastidx
+	} else if offset < 0 {
+		offset = 0
+	}
+	s.offset[s.log.ARN()] = offset
+
 	s.changed[s.log.ARN()] = true
 }
 
@@ -545,4 +632,46 @@ func (s *DisplayLogScreen) prev(_ context.Context) {
 	}
 	s.log = s.logs[next]
 	s.changed[s.log.ARN()] = true
+}
+
+const (
+	viewModeStream   = 0
+	viewModeOpenAlt  = 1
+	viewModeAlt      = 2
+	viewModeCloseAlt = 3
+)
+
+func (s *DisplayLogScreen) viewMode(_ context.Context) {
+	if len(s.buffers[s.log.ARN()]) == 0 {
+		return
+	}
+
+	s.live[s.log.ARN()] = false
+	switch s.view[s.log.ARN()] {
+	case viewModeStream:
+		s.view[s.log.ARN()] = viewModeOpenAlt
+	case viewModeAlt:
+		s.view[s.log.ARN()] = viewModeCloseAlt
+	}
+	s.changed[s.log.ARN()] = true
+}
+
+func (s *DisplayLogScreen) handleViewMode(_ context.Context, tty *TTY) {
+	if len(s.buffers[s.log.ARN()]) == 0 {
+		return
+	}
+
+	view := s.view[s.log.ARN()]
+	switch view {
+	case viewModeOpenAlt:
+		tty.Clear()
+		s.view[s.log.ARN()] = viewModeAlt
+
+	case viewModeCloseAlt:
+		tty.Clear()
+		s.view[s.log.ARN()] = viewModeStream
+
+	default:
+		return
+	}
 }

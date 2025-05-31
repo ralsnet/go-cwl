@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ralsnet/go-cwl"
 )
@@ -11,6 +12,11 @@ func main() {
 	defer cancel()
 
 	app := cwl.NewApp()
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println(err)
+		}
+	}()
 	if err := app.Start(ctx); err != nil {
 		panic(err)
 	}

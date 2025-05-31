@@ -3,6 +3,7 @@ package cwl
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,6 +42,11 @@ func LoadAWSConfigs(ctx context.Context, excludeProfiles []string) (map[string]a
 		wg.Add(1)
 		go func(profile string) {
 			defer wg.Done()
+			defer func() {
+				if err := recover(); err != nil {
+					fmt.Println(err)
+				}
+			}()
 			cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
 			if err != nil {
 				return
