@@ -95,6 +95,10 @@ func (a *App) handleCtrl(ctx context.Context, ctrl string) (bool, error) {
 	return a.screen.HandleCtrl(ctx, ctrl)
 }
 
+func (a *App) handleMouse(ctx context.Context, code, x, y int) (bool, error) {
+	return a.screen.HandleMouse(ctx, code, x, y)
+}
+
 func (a *App) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -127,6 +131,16 @@ func (a *App) Start(ctx context.Context) error {
 	defer a.Close()
 
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				a.ForceUnlock()
+				quit = true
+				cancel()
+				a.Close()
+				fmt.Println(err)
+			}
+		}()
+
 		if err := a.ShowLoading(ctx); err != nil {
 			a.ForceUnlock()
 			quit = true
@@ -137,6 +151,10 @@ func (a *App) Start(ctx context.Context) error {
 	}()
 
 	go func() {
+		defer func() {
+			a.ForceUnlock()
+		}()
+
 		ctrl := false
 		ctrlCode := ""
 		for !quit {
@@ -149,17 +167,19 @@ func (a *App) Start(ctx context.Context) error {
 
 			if string(r) == "\x1b" {
 				ctrl = true
-				go func() {
-					time.Sleep(time.Millisecond * 10)
-					ctrl = false
-				}()
-				a.mu.Unlock()
-				continue
+				chars := make([]byte, 2)
+				_, err := a.tty.Read(chars)
+				if err != nil {
+					a.mu.Unlock()
+					return
+				}
+				ctrlCode = string(chars)
+				r = rune(chars[1])
 			}
+
 			if ctrl {
-				ctrlCode += string(r)
-				if ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') {
-					ctrl = false
+				ctrl = false
+				if 'A' <= r && r <= 'D' || r == 'H' {
 					handled, err := a.handleCtrl(ctx, "\x1b"+ctrlCode)
 					if err != nil {
 						a.mu.Unlock()
@@ -169,8 +189,26 @@ func (a *App) Start(ctx context.Context) error {
 						a.mu.Unlock()
 						return
 					}
-					ctrlCode = ""
+				} else if r == 'M' {
+					// load mouse information 3bytes
+					buf := make([]byte, 3)
+					_, err := a.tty.Read(buf)
+					if err != nil {
+						a.mu.Unlock()
+						return
+					}
+
+					handled, err := a.handleMouse(ctx, int(buf[0])-32, int(buf[1])-32, int(buf[2])-32)
+					if err != nil {
+						a.mu.Unlock()
+						return
+					}
+					if !handled {
+						a.mu.Unlock()
+						return
+					}
 				}
+				ctrlCode = ""
 				a.mu.Unlock()
 				continue
 			}
@@ -200,6 +238,7 @@ func (a *App) Start(ctx context.Context) error {
 	}()
 
 	ticker := time.NewTicker(time.Second / fps)
+	// ticker := time.NewTicker(time.Second * 3)
 	defer ticker.Stop()
 	for {
 		a.mu.Lock()

@@ -8,6 +8,30 @@ import (
 )
 
 const (
+	ScreenClearBelow = "\x1b[0J"
+	ScreenClearAbove = "\x1b[1J"
+	ScreenClearAll   = "\x1b[2J"
+	ScreenClearLine  = "\x1b[2K"
+	ScreenScroll     = "\x1b[%dT"
+	ScreenReset      = "\x1b[0m"
+	ScreenEnableAlt  = "\x1b[?1049h"
+	ScreenDisableAlt = "\x1b[?1049l"
+	CursorHome       = "\x1b[H"
+	CursorUp         = "\x1b[A"
+	CursorDown       = "\x1b[B"
+	CursorRight      = "\x1b[C"
+	CursorLeft       = "\x1b[D"
+	CursorMove       = "\x1b[%d;%dH"
+	CursorSave       = "\x1b[s"
+	CursorRestore    = "\x1b[u"
+	CursorPosition   = "\x1b[6n"
+	CursorNextLine   = "\x1b[1E"
+	CursorPrevLine   = "\x1b[1F"
+	CursorHide       = "\x1b[?25l"
+	CursorShow       = "\x1b[?25h"
+)
+
+const (
 	LF = "\n"
 )
 
@@ -28,6 +52,7 @@ func (t *TTY) Open() error {
 	}
 	t.EnableAlt()
 	t.HideCursor()
+	t.EnableMouse()
 	return nil
 }
 
@@ -35,6 +60,7 @@ func (t *TTY) Close() error {
 	if t.t != nil {
 		t.DisableAlt()
 		t.ShowCursor()
+		t.DisableMouse()
 		t.t.Close()
 	}
 	return nil
@@ -42,6 +68,17 @@ func (t *TTY) Close() error {
 
 func (t *TTY) Rune() (rune, error) {
 	return t.t.ReadRune()
+}
+
+func (t *TTY) Read(p []byte) (n int, err error) {
+	for i := 0; i < len(p); i++ {
+		r, err := t.t.ReadRune()
+		if err != nil {
+			return i, err
+		}
+		p[i] = byte(r)
+	}
+	return len(p), nil
 }
 
 func (t *TTY) Write(p []byte) (n int, err error) {
@@ -82,6 +119,20 @@ func (t *TTY) Clear() error {
 
 func (t *TTY) ClearLine() error {
 	if _, err := t.t.Output().WriteString(ScreenClearLine); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *TTY) EnableMouse() error {
+	if _, err := t.t.Output().WriteString("\x1b[?1000h"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *TTY) DisableMouse() error {
+	if _, err := t.t.Output().WriteString("\x1b[?1000l"); err != nil {
 		return err
 	}
 	return nil

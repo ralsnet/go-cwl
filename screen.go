@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -15,34 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 )
 
-const (
-	ScreenClearBelow = "\x1b[0J"
-	ScreenClearAbove = "\x1b[1J"
-	ScreenClearAll   = "\x1b[2J"
-	ScreenClearLine  = "\x1b[2K"
-	ScreenScroll     = "\x1b[%dT"
-	ScreenReset      = "\x1b[0m"
-	ScreenEnableAlt  = "\x1b[?1049h"
-	ScreenDisableAlt = "\x1b[?1049l"
-	CursorHome       = "\x1b[H"
-	CursorUp         = "\x1b[A"
-	CursorDown       = "\x1b[B"
-	CursorRight      = "\x1b[C"
-	CursorLeft       = "\x1b[D"
-	CursorMove       = "\x1b[%d;%dH"
-	CursorSave       = "\x1b[s"
-	CursorRestore    = "\x1b[u"
-	CursorPosition   = "\x1b[6n"
-	CursorNextLine   = "\x1b[1E"
-	CursorPrevLine   = "\x1b[1F"
-	CursorHide       = "\x1b[?25l"
-	CursorShow       = "\x1b[?25h"
-)
-
 type Screen interface {
 	Render(ctx context.Context, tty *TTY) error
 	HandleInput(ctx context.Context, r rune) (bool, error)
 	HandleCtrl(ctx context.Context, ctrl string) (bool, error)
+	HandleMouse(ctx context.Context, code, x, y int) (bool, error)
 	Init(ctx context.Context)
 }
 
@@ -60,7 +38,6 @@ func (s *LoadingScreen) Init(ctx context.Context) {
 }
 
 func (s *LoadingScreen) Render(ctx context.Context, tty *TTY) error {
-	fmt.Println("LoadingScreen.Render")
 	if err := tty.Clear(); err != nil {
 		return err
 	}
@@ -82,6 +59,10 @@ func (s *LoadingScreen) HandleInput(ctx context.Context, r rune) (bool, error) {
 }
 
 func (s *LoadingScreen) HandleCtrl(ctx context.Context, ctrl string) (bool, error) {
+	return true, nil
+}
+
+func (s *LoadingScreen) HandleMouse(ctx context.Context, code, x, y int) (bool, error) {
 	return true, nil
 }
 
@@ -245,6 +226,26 @@ func (s *ChooseLogsScreen) HandleCtrl(ctx context.Context, ctrl string) (bool, e
 	return true, nil
 }
 
+func (s *ChooseLogsScreen) HandleMouse(ctx context.Context, code, x, y int) (bool, error) {
+	switch code {
+	case 0:
+		if y < 3 {
+			return true, nil
+		}
+		s.changed = true
+		clickidx := s.offset + y - 4
+		eq := clickidx == s.index
+		s.index = s.offset + y - 4
+		if s.index < 0 {
+			s.index = 0
+		}
+		if eq {
+			return s.HandleInput(ctx, ' ')
+		}
+	}
+	return true, nil
+}
+
 func (s *ChooseLogsScreen) filterLogs() {
 	if s.filter == "" {
 		s.filtered = s.logs
@@ -343,7 +344,9 @@ func NewDisplayLogScreen(logs []*LogGroup, back func([]*LogGroup)) *DisplayLogSc
 
 func (s *DisplayLogScreen) Init(ctx context.Context) {
 	for _, log := range s.logs {
-		go func(log *LogGroup) {
+		go func(ctx context.Context, log *LogGroup) {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			s.rw.Lock()
 			s.buffers[log.ARN()] = []*LogEvent{}
 			stream, err := log.Stream(ctx)
@@ -356,17 +359,19 @@ func (s *DisplayLogScreen) Init(ctx context.Context) {
 			s.live[log.ARN()] = true
 			s.changed[log.ARN()] = true
 			s.rw.Unlock()
-			defer func() {
+			defer func(stream *cloudwatchlogs.StartLiveTailEventStream) {
 				if err := recover(); err != nil {
-					fmt.Println(err)
+					cancel()
 				}
 				stream.Close()
-				delete(s.streams, log.ARN())
-				delete(s.index, log.ARN())
-				delete(s.changed, log.ARN())
-			}()
+			}(stream)
 			for {
-				evt := <-stream.Events()
+				var evt interface{}
+				select {
+				case <-ctx.Done():
+					return
+				case evt = <-stream.Events():
+				}
 				u, ok := evt.(*types.StartLiveTailResponseStreamMemberSessionUpdate)
 				if !ok {
 					continue
@@ -385,7 +390,7 @@ func (s *DisplayLogScreen) Init(ctx context.Context) {
 				}
 				s.rw.Unlock()
 			}
-		}(log)
+		}(ctx, log)
 	}
 }
 
@@ -504,6 +509,12 @@ func (s *DisplayLogScreen) Render(ctx context.Context, tty *TTY) error {
 	}
 
 	body := strings.ReplaceAll(buf.String(), "\n", CursorNextLine)
+
+	body = regexp.MustCompile(`ERROR`).ReplaceAllString(body, "\x1b[31m$0\x1b[33m")
+	body = regexp.MustCompile(`INFO`).ReplaceAllString(body, "\x1b[32m$0\x1b[33m")
+	body = regexp.MustCompile(`WARN`).ReplaceAllString(body, "\x1b[35m$0\x1b[33m")
+	body = regexp.MustCompile(`DEBUG`).ReplaceAllString(body, "\x1b[34m$0\x1b[33m")
+
 	tty.WriteString("%s", body)
 
 	return nil
@@ -558,6 +569,39 @@ func (s *DisplayLogScreen) HandleCtrl(ctx context.Context, ctrl string) (bool, e
 	return true, nil
 }
 
+func (s *DisplayLogScreen) HandleMouse(ctx context.Context, code, x, y int) (bool, error) {
+	s.rw.Lock()
+	defer s.rw.Unlock()
+	switch code {
+	case 0x00: // Left Click
+		if y < 2 {
+			return true, nil
+		}
+		if len(s.buffers[s.log.ARN()]) == 0 {
+			return true, nil
+		}
+		lastidx := len(s.buffers[s.log.ARN()]) - 1
+		clickidx := s.offset[s.log.ARN()] + y - 2
+		if clickidx > lastidx {
+			clickidx = lastidx
+		}
+		if clickidx < 0 {
+			clickidx = 0
+		}
+		curidx := s.index[s.log.ARN()]
+		s.index[s.log.ARN()] = clickidx
+		s.changed[s.log.ARN()] = true
+		if clickidx == curidx {
+			s.viewMode(ctx)
+		}
+	case 0x40: // Wheel Up
+		s.cursorUp(ctx, 1)
+	case 0x41: // Wheel Down
+		s.cursorDown(ctx, 1)
+	}
+	return true, nil
+}
+
 func (s *DisplayLogScreen) cursorUp(_ context.Context, move int) {
 	lastidx := len(s.buffers[s.log.ARN()]) - 1
 	if lastidx < 0 {
@@ -569,6 +613,8 @@ func (s *DisplayLogScreen) cursorUp(_ context.Context, move int) {
 	index := s.index[s.log.ARN()] - move
 	if index < 0 {
 		index = 0
+	} else if index > lastidx {
+		index = lastidx
 	}
 	s.index[s.log.ARN()] = index
 
@@ -593,6 +639,8 @@ func (s *DisplayLogScreen) cursorDown(_ context.Context, move int) {
 	index := s.index[s.log.ARN()] + move
 	if index > lastidx {
 		index = lastidx
+	} else if index < 0 {
+		index = 0
 	}
 	s.index[s.log.ARN()] = index
 
@@ -666,10 +714,12 @@ func (s *DisplayLogScreen) handleViewMode(_ context.Context, tty *TTY) {
 	case viewModeOpenAlt:
 		tty.Clear()
 		s.view[s.log.ARN()] = viewModeAlt
+		tty.DisableMouse()
 
 	case viewModeCloseAlt:
 		tty.Clear()
 		s.view[s.log.ARN()] = viewModeStream
+		tty.EnableMouse()
 
 	default:
 		return
